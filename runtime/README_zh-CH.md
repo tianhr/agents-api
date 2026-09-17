@@ -101,7 +101,6 @@ func main() {
 | `WithAPIKey(apiKey string)`           | 可选 API Key                       |
 | `WithAuthHeader(header string)`       | 覆盖默认的 Authorization 头            |
 | `WithSandboxBaseURL(url string)`      | 完全覆盖 URL 拼装                      |
-| `WithCodeInterpreterPort(port int)`   | 代码解释器端口，默认 `49999`              |
 | `WithCodeInterpreterBaseURL(url string)` | 覆盖代码解释器 base URL（E2B NATIVE/PRIVATE 协议将端口内嵌在 URL 中） |
 | `WithHeader(key, value string)`       | 添加单个自定义 header                   |
 | `WithHeaders(headers map)`            | 合并多个自定义 headers                  |

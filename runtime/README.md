@@ -105,7 +105,6 @@ The runtime client **does not involve Protocol** — only `Scheme` + `Domain` ar
 | `WithAPIKey(apiKey string)`           | Optional API Key                               |
 | `WithAuthHeader(header string)`       | Override default Authorization header          |
 | `WithSandboxBaseURL(url string)`      | Completely override URL assembly               |
-| `WithCodeInterpreterPort(port int)`   | Code interpreter port, defaults to `49999`     |
 | `WithCodeInterpreterBaseURL(url string)` | Override code interpreter base URL (E2B NATIVE/PRIVATE embed the port in the URL) |
 | `WithHeader(key, value string)`       | Add a single custom header                     |
 | `WithHeaders(headers map)`            | Merge multiple custom headers                  |
