@@ -70,7 +70,35 @@ func main() {
 	fmt.Println("\n--- Filesystem Operations Demo ---")
 	demonstrateFileOperations(ctx, sb.Files)
 
+	// ========== 7. Code Interpreter Demo ==========
+	fmt.Println("\n--- Code Interpreter Demo ---")
+	demonstrateCodeInterpreter(ctx, sb)
+
 	fmt.Println("\n========== Example completed ==========")
+}
+
+// demonstrateCodeInterpreter executes Python code in the sandbox via the
+// code-interpreter service (routed to port 49999 automatically based on the
+// configured Protocol).
+func demonstrateCodeInterpreter(ctx context.Context, sb *sandbox.Sandbox) {
+	exec, err := sb.CodeInterpreter.RunCode(ctx, "import math\nmath.sqrt(16)")
+	if err != nil {
+		fmt.Printf("Error running code: %v\n", err)
+		return
+	}
+	fmt.Printf("Main result: %s\n", exec.Text())
+	fmt.Printf("Stdout: %v\n", exec.Logs.Stdout)
+
+	// Streaming callbacks fire in real time while the aggregated
+	// Execution is still returned.
+	exec, err = sb.CodeInterpreter.RunCode(ctx, "for i in range(3):\n    print(f'line {i}')", runtime.RunCodeOpts{
+		OnStdout: func(e runtime.StdoutEvent) { fmt.Printf("  [stdout] %s", e.Text) },
+	})
+	if err != nil {
+		fmt.Printf("Error running streaming code: %v\n", err)
+		return
+	}
+	fmt.Printf("Streamed %d stdout chunks\n", len(exec.Logs.Stdout))
 }
 
 // listSandboxes lists all running sandboxes.
