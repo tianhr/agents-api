@@ -35,19 +35,42 @@ print(f"command output: {result.stdout}")
 execution = sandbox.run_code("print('hello from jupyter')")
 print(f"jupyter output: {''.join(execution.logs.stdout)}")
 
-sandbox.beta_pause()
+sandbox.pause(request_timeout=300)
 print(f"sandbox {sandbox.sandbox_id} paused, wait 30s before resuming")
 time.sleep(30)
 
 input("press Enter to connect (resume) the sandbox...")
-sandbox.connect()
+# request_timeout: HTTP wait for the connect (resume) call, default 60s — resume
+# re-schedules the sandbox pod, so give it room. NOTE: connect(timeout=...) is
+# a DIFFERENT knob — the sandbox lifetime after resume, not the wait time.
+sandbox.connect(request_timeout=300)
 print("sandbox resumed")
 
 # Verify data plane still works after resume (token should refresh if expired)
 result = sandbox.commands.run("echo 'hello after resume'")
 print(f"command output after resume: {result.stdout}")
 
-execution = sandbox.run_code("print('hello from jupyter after resume')")
+# envd (the commands channel) boots before the pod turns Ready, but the Jupyter
+# server behind run_code (sandbox port 49999) needs a few more seconds: resume
+# recreates the pod, so Jupyter starts fresh. The upstream E2E suite hides this
+# window with retries (test/e2b/utils.py run_code_sandbox: 5 attempts, 5s apart);
+# a single shot right after resume can hit the gateway's 503 "connection refused".
+execution = None
+for attempt in range(5):
+    try:
+        execution = sandbox.run_code("print('hello from jupyter after resume')")
+        break
+    except Exception as exc:
+        print(f"jupyter not ready yet (attempt {attempt + 1}/5): {exc}")
+        if attempt == 0:
+            ports = sandbox.commands.run(
+                "ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null || true",
+                timeout=10,
+            ).stdout
+            print(f"    sandbox listening ports (49999 = jupyter):\n{ports}")
+        time.sleep(5)
+if execution is None:
+    raise RuntimeError("jupyter did not come back after resume")
 print(f"jupyter output after resume: {''.join(execution.logs.stdout)}")
 
 input("press Enter to kill the sandbox...")
