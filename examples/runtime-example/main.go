@@ -14,15 +14,35 @@ import (
 )
 
 const (
-	sandboxName = "openclaw-advanced-k8s-sbs-lght9"
-	namespace   = "default"
-	gatewayUrl  = "127.0.0.1:7788"
+	// Defaults can be overridden via environment variables so a prebuilt
+	// binary can be pointed at any environment without recompiling:
+	//
+	//	SANDBOX_NAME -> sandboxName
+	//	NAMESPACE    -> namespace
+	//	GATEWAY_URL  -> gatewayUrl
+	defaultSandboxName = "openclaw-advanced-k8s-sbs-lght9"
+	defaultNamespace   = "default"
+	defaultGatewayURL  = "127.0.0.1:7788"
 )
+
+// envOr returns the value of the environment variable key, or fallback when
+// unset or empty.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 func main() {
 	ctx := context.Background()
 
+	sandboxName := envOr("SANDBOX_NAME", defaultSandboxName)
+	namespace := envOr("NAMESPACE", defaultNamespace)
+	gatewayUrl := envOr("GATEWAY_URL", defaultGatewayURL)
+
 	fmt.Println("\n========== runtime direct client example ==========")
+	fmt.Printf("Config: namespace=%s, sandbox=%s, gateway=%s\n", namespace, sandboxName, gatewayUrl)
 
 	// Build a runtime client directly from the K8s Sandbox CR.
 	// NewFromK8s automatically resolves sandboxID and runtimeToken.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	sandbox "github.com/openkruise/agents-api/e2b"
@@ -11,15 +12,35 @@ import (
 )
 
 const (
-	apiKey   = "your-apiKey"
-	domain   = "your.domain.com"
-	template = "code-interpreter"
+	// Defaults can be overridden via environment variables so a prebuilt
+	// binary can be pointed at any environment without recompiling:
+	//
+	//	E2B_API_KEY  -> apiKey
+	//	E2B_DOMAIN   -> domain
+	//	E2B_TEMPLATE -> template
+	defaultAPIKey   = "your-apiKey"
+	defaultDomain   = "your.domain.com"
+	defaultTemplate = "code-interpreter"
 )
+
+// envOr returns the value of the environment variable key, or fallback when
+// unset or empty.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 func main() {
 	ctx := context.Background()
 
+	apiKey := envOr("E2B_API_KEY", defaultAPIKey)
+	domain := envOr("E2B_DOMAIN", defaultDomain)
+	template := envOr("E2B_TEMPLATE", defaultTemplate)
+
 	fmt.Println("========== E2B Sandbox Go SDK Example ==========")
+	fmt.Printf("Config: domain=%s, template=%s\n", domain, template)
 
 	// ========== 1. Connection Configuration ==========
 	// Defaults: Protocol = Native (subdomain-based), Scheme = "https".
