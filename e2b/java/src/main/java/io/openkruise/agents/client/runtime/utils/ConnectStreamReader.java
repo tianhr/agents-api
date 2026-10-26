@@ -124,6 +124,7 @@ public class ConnectStreamReader<T extends Message> implements Iterator<T>, Mess
     /**
      * Error message from trailer frame, available after hasNext() returns false.
      */
+    @Override
     public String getTrailerError() {
         return trailerError;
     }
@@ -131,6 +132,7 @@ public class ConnectStreamReader<T extends Message> implements Iterator<T>, Mess
     /**
      * If hasNext() returns false due to an IO exception, this method can retrieve it.
      */
+    @Override
     public IOException getLastError() {
         return lastError;
     }

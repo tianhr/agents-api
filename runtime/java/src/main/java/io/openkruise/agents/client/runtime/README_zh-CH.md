@@ -14,8 +14,9 @@ runtime/
 ├── EnvdMethods.java              # envd 服务名和方法名常量
 ├── commands/                     # 命令执行
 │   ├── Commands.java             # run / runBackground / kill / sendInput / list / connect
-│   ├── CommandHandle.java        # 后台进程句柄：waitForCompletion / kill / close
-│   └── CommandResult.java        # 命令执行结果：stdout / stderr / exitCode
+│   ├── CommandHandle.java        # 后台进程句柄：waitForCompletion / kill / disconnect
+│   ├── CommandResult.java        # 命令执行结果：stdout / stderr / exitCode
+│   └── CommandExitException.java # 非零退出码时抛出（携带完整结果）
 ├── filesystem/                   # 文件系统
 │   ├── Filesystem.java           # listDir / read / write / makeDir / remove / watchDir / move
 │   └── WatchHandle.java          # 目录监听句柄：stop
@@ -133,7 +134,7 @@ try (RuntimeClient client = RuntimeClient.newFromK8s("default", "your-sandbox-na
 | `.authHeader(String)`           | 覆盖默认的 Authorization 头                       |
 | `.headers(Map<String, String>)` | 合并多个自定义 headers                             |
 | `.addHeader(String, String)`    | 添加单个自定义 header                              |
-| `.requestTimeoutMs(long)`       | HTTP 超时（毫秒），默认 60000                        |
+| `.requestTimeoutMs(long)`       | 单次请求（list/kill/sendInput）的超时（毫秒）；同时限制 Start/ConnectToProcess 等待命令启动的时长。0 = 禁用；默认 60000 |
 | `.sandboxPort(int)`             | envd 端口，默认 49983（用于请求头 `e2b-sandbox-port`）  |
 | `.codeInterpreterPort(int)`     | 代码解释器端口，默认 49999                            |
 | `.urlBuilder(URLBuilder)`       | URL 构建器，支持 E2B 和 Runtime 模式                 |
@@ -193,6 +194,7 @@ try (RuntimeClient client = RuntimeClient.create("sandbox-id", config)) {
 | `sendSignal(int pid, Signal signal)`            | 向指定进程发送信号                             |
 | `closeStdin(int pid)`                           | 关闭指定进程的 stdin                         |
 | `connect(int pid)`                              | 重新连接到已运行的进程，订阅其后续输出                   |
+| `connect(int pid, ConnectOptions options)`      | 重连（带 per-call 选项，与 Start 相同的两层超时）        |
 
 ### RunOptions
 
@@ -201,17 +203,31 @@ RunOptions opts = new RunOptions()
     .envs(Map.of("LANG", "C"))               // 环境变量
     .cwd("/tmp")                              // 工作目录
     .user("nobody")                           // 以该用户执行（镜像内须已存在，不含 ':'）；仅作用于 run/runBackground；不设置 = 默认（root）
+    .requestTimeoutMs(3000)                   // 等待命令启动的时间上限（毫秒）；命令启动后即解除。0 = 禁用该等待（Go：无禁用值）。不设置 = 客户端默认（60 秒）
+    .timeoutMs(60000)                         // 整条命令流的时间上限（毫秒）：连接握手到结束事件。0 或不设置 = 不限制（E2B 官方 SDK 默认 60 秒，需要限制请显式设置）。超时只断流报错，进程仍在沙箱中运行
     .onStdout(line -> System.out.print(line)) // 流式 stdout 回调
     .onStderr(line -> System.err.print(line));// 流式 stderr 回调
 ```
 
+### ConnectOptions
+
+`connect` 与 `start` 一样支持两层 per-call 超时，由
+`connect(int pid, ConnectOptions)` 的 `ConnectOptions` 配置：
+
+```java
+ConnectOptions opts = new ConnectOptions()
+    .requestTimeoutMs(3000)                   // 等待 connect start event 的时间上限（毫秒）；事件到达即解除。0 = 禁用该等待（Go：无禁用值）。不设置 = 客户端默认（60 秒）
+    .timeoutMs(60000)                         // 整条 connect 流的时间上限（毫秒）。0 或不设置 = 不限制。超时只断流报错，进程仍在沙箱中运行
+```
+
 ### CommandResult
 
-| 字段         | 类型       | 说明   |
-|------------|----------|------|
-| `stdout`   | `String` | 标准输出 |
-| `stderr`   | `String` | 标准错误 |
-| `exitCode` | `int`    | 退出码  |
+| 字段         | 类型       | 说明                                    |
+|------------|----------|---------------------------------------|
+| `stdout`   | `String` | 标准输出                                |
+| `stderr`   | `String` | 标准错误                                |
+| `exitCode` | `int`    | 退出码                                 |
+| `error`    | `String` | 结束事件携带的服务端错误消息（如 spawn 失败）；正常退出为空 |
 
 ### CommandHandle
 
@@ -221,8 +237,9 @@ RunOptions opts = new RunOptions()
 |-----------------------|---------------------------|
 | `getPid()`            | 返回进程 PID                  |
 | `isCompleted()`       | 是否已完成                     |
-| `waitForCompletion()` | 阻塞等待结束，返回 `CommandResult` |
+| `waitForCompletion()` | 阻塞等待结束，返回 `CommandResult`；退出码非零时抛出 `CommandExitException`（携带完整结果） |
 | `kill()`              | 终止进程                      |
+| `disconnect()`        | 停止读取输出、不终止进程；阻塞中的 `waitForCompletion()` 会以异常失败 |
 | `close()`             | 关闭流和底层 HTTP 资源            |
 
 ### 示例
@@ -475,6 +492,7 @@ client.codeInterpreter.runCodeStreaming(request, event -> {
 | 异常类                     | 说明                            |
 |-------------------------|-------------------------------|
 | `SandboxException`      | 沙箱运行时异常（命令执行失败、流读取错误等）        |
+| `CommandExitException`  | 命令以非零退出码结束；携带 stdout/stderr/exit code 及结束事件 `error` |
 | `K8sOperationException` | K8s 操作异常（CR 查询失败、token 提取失败等） |
 
 ---
