@@ -215,6 +215,10 @@ func (c *Commands) Run(ctx context.Context, cmd string, opts ...RunOpts) (*Comma
 }
 
 // Start starts a command and returns a CommandHandle for interacting with it.
+// The handle keeps the stream's child context (and the opt.Timeout timer)
+// alive until Wait/Disconnect completes or the returned handle is otherwise
+// released; dropping the handle without either leaves them to the parent
+// context — call Wait or Disconnect to release them deterministically.
 func (c *Commands) Start(ctx context.Context, cmd string, opts ...RunOpts) (*CommandHandle, error) {
 	opt := RunOpts{}
 	if len(opts) > 0 {
@@ -347,7 +351,11 @@ func (c *Commands) Start(ctx context.Context, cmd string, opts ...RunOpts) (*Com
 	// Kill decouples from the stream context: after a timeout or cancel
 	// cuts the stream (or the caller's context dies), killing the process
 	// must still work — kill stays an explicit, independent operation in
-	// the official E2B contract.
+	// the official E2B contract. WithoutCancel strips the deadline but
+	// also all context values (trace spans, context-carried credentials);
+	// auth is unaffected because the headers come from c.headers, but
+	// tracing through the kill RPC is lost — accepted for now, since the
+	// alternative would couple the kill to the dying stream context.
 	return NewCommandHandle(pid, stream, func() bool {
 		killed, _ := c.Kill(context.WithoutCancel(ctx), pid)
 		return killed
@@ -403,6 +411,10 @@ type ConnectOpts struct {
 }
 
 // ConnectToProcess connects to a running command by PID.
+// The handle keeps the stream's child context (and the opt.Timeout timer)
+// alive until Wait/Disconnect completes or the returned handle is otherwise
+// released; dropping the handle without either leaves them to the parent
+// context — call Wait or Disconnect to release them deterministically.
 func (c *Commands) ConnectToProcess(ctx context.Context, pid uint32, opts ...ConnectOpts) (*CommandHandle, error) {
 	opt := ConnectOpts{}
 	if len(opts) > 0 {
@@ -500,7 +512,11 @@ func (c *Commands) ConnectToProcess(ctx context.Context, pid uint32, opts ...Con
 	// Kill decouples from the stream context: after a timeout or cancel
 	// cuts the stream (or the caller's context dies), killing the process
 	// must still work — kill stays an explicit, independent operation in
-	// the official E2B contract.
+	// the official E2B contract. WithoutCancel strips the deadline but
+	// also all context values (trace spans, context-carried credentials);
+	// auth is unaffected because the headers come from c.headers, but
+	// tracing through the kill RPC is lost — accepted for now, since the
+	// alternative would couple the kill to the dying stream context.
 	return NewCommandHandleFromConnect(actualPid, stream, func() bool {
 		killed, _ := c.Kill(context.WithoutCancel(ctx), actualPid)
 		return killed

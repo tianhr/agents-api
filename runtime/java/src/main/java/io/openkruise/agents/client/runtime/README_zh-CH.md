@@ -179,7 +179,7 @@ try (RuntimeClient client = RuntimeClient.create("sandbox-id", config)) {
 
 ## 三、命令执行（Commands）
 
-通过 `client.commands` 操作容器内进程。底层基于 OkHttp + Connect Protocol，命令统一通过 `/bin/bash -l -c <cmd>` 执行。
+通过 `client.commands` 操作容器内进程。底层基于 OkHttp + Connect Protocol，命令统一通过 `<shell> -l -c <cmd>` 执行（默认 shell 为 `/bin/bash`，可经 `RunOptions.shell()` 覆盖）。
 
 ### 方法一览
 
@@ -238,7 +238,7 @@ ConnectOptions opts = new ConnectOptions()
 | `getPid()`            | 返回进程 PID                  |
 | `isCompleted()`       | 是否已完成                     |
 | `waitForCompletion()` | 阻塞等待结束，返回 `CommandResult`；退出码非零时抛出 `CommandExitException`（携带完整结果） |
-| `kill()`              | 终止进程                      |
+| `kill()`              | 终止进程；当 envd 报告进程已不存在时抛出 `IllegalStateException`（未发出信号，完成 claim 会回滚） |
 | `disconnect()`        | 停止读取输出、不终止进程；阻塞中的 `waitForCompletion()` 会以异常失败 |
 | `close()`             | 关闭流和底层 HTTP 资源            |
 
@@ -253,11 +253,12 @@ System.out.println(res.getStdout());
 CommandResult res2 = client.commands.run("ls -la /tmp",
     new RunOptions().cwd("/tmp").onStdout(System.out::print));
 
-// 后台启动 + 主动 Kill
-CommandHandle handle = client.commands.runBackground("sleep 60", new RunOptions());
-System.out.println("pid = " + handle.getPid());
-handle.kill();
-handle.close();
+// 后台启动 + 主动 Kill —— try-with-resources 保证流一定被释放，
+// 即使进程已不存在导致 kill() 抛异常
+try (CommandHandle handle = client.commands.runBackground("sleep 60", new RunOptions())) {
+    System.out.println("pid = " + handle.getPid());
+    handle.kill();
+}
 
 // 列出进程
 List<ProcessInfo> procs = client.commands.list();

@@ -45,6 +45,13 @@ public class CommandHandle implements AutoCloseable {
      * "no end event" failure, which would also turn sticky and discard
      * any late end event. Cleared by the failed-kill rollback. */
     private volatile boolean killed;
+    /** Set once the kill RPC settled successfully (or there is no
+     * killAction at all), making the claim permanent — no rollback path
+     * can run afterwards. Read by the entry fast path of
+     * waitForCompletion() to decide whether closing the output stream is
+     * safe: before the RPC settles, a failure would roll the claim back
+     * and the stream must stay readable for a retry. */
+    private volatile boolean killConfirmed;
     /** The server-side error message delivered in the end event, when one
      * was present (envd reports e.g. spawn failures there); empty when the
      * process exited normally. Carried into the CommandResult like the
@@ -170,8 +177,9 @@ public class CommandHandle implements AutoCloseable {
      * {@link #disconnect()}, interrupted by an IO failure, or closed by the
      * server — a {@link SandboxException} is thrown instead of silently
      * returning a partial result. A local {@link #kill()} is the one
-     * exception: a wait unblocked by the kill claim returns the synthetic
-     * exit code -1 (see kill()).
+     * exception: when its completion claim unblocks a wait and the stream
+     * then yields no end event, the wait returns the synthetic exit code
+     * -1 (see kill()).
      * If the command finishes with a non-zero
      * exit code, a {@link CommandExitException} carrying the full result
      * (stdout, stderr, exit code) is thrown — the official E2B SDK
@@ -191,6 +199,17 @@ public class CommandHandle implements AutoCloseable {
             throw failure;
         }
         if (completed.get()) {
+            // Release the output stream when the claim is permanent: a
+            // kill-then-wait never enters the read loop (whose finally
+            // would close it), leaving the OkHttp connection open until
+            // GC otherwise. While the kill RPC is still in flight the
+            // stream must stay open — a failed RPC rolls the claim back
+            // and the handle must remain readable (retry kill / wait).
+            // sawEndEvent means the read loop already closed it; close()
+            // is CAS-guarded, so this is idempotent.
+            if (sawEndEvent || killConfirmed) {
+                close();
+            }
             return createResult();
         }
 
@@ -224,10 +243,9 @@ public class CommandHandle implements AutoCloseable {
             // event (processResponse) or by kill(); marking a failed stream
             // complete would make a second call silently return a partial
             // result and make kill() a no-op — contradicting the fail-loudly
-            // contract above.
-            synchronized (this) {
-                close();
-            }
+            // contract above. close() is CAS-guarded, so a double close with
+            // a concurrent fast-path release is safe.
+            close();
         }
 
         if (!unblockedByKill) {
@@ -389,18 +407,27 @@ public class CommandHandle implements AutoCloseable {
     }
 
     /**
-     * Terminates the command (SIGKILL). The completion claim immediately
-     * unblocks a {@link #waitForCompletion()} call that is waiting on the
-     * stream: it finishes the frame it is processing and returns the
-     * synthetic exit code -1 without waiting for envd's end event. Only
-     * when the real end event was already read before the claim does the
-     * wait report it — a non-zero exit code still throws a
-     * {@link CommandExitException} carrying the real code (e.g. 137), the
-     * same throw-on-non-zero contract as any other end event. A
-     * waitForCompletion() call made only after kill() returns immediately
-     * with the synthetic exit code -1; that early return bypasses the
-     * non-zero-exit check, so only a real end event (not the synthetic
-     * kill code) triggers the exception.
+     * Terminates the command (SIGKILL) and claims completion. The claim
+     * does not cancel the output stream: a {@link #waitForCompletion()}
+     * call already blocked on it is released when the read loop reaches
+     * the next frame or the stream end — normally envd's end event for
+     * the killed process, whose real exit code (e.g. 137) overwrites the
+     * synthetic one and is reported like any other end event (a non-zero
+     * code still throws a {@link CommandExitException}). The synthetic
+     * exit code -1 is returned only when the stream ends with no end
+     * event while the claim is active. If the stream never yields
+     * another frame after a successful kill — envd stall or crash, or
+     * a dropped connection that has not timed out — the blocked wait
+     * stays blocked; bound it with
+     * RunOptions/ConnectOptions timeoutMs if that matters.
+     * A waitForCompletion() call made only after kill() returns
+     * immediately with the synthetic exit code -1 from the entry fast
+     * path, without waiting for envd's end event; that early return
+     * bypasses the non-zero-exit check, so only a real end event (not
+     * the synthetic kill code) triggers the exception. The fast path
+     * also releases the output stream once the kill RPC has settled
+     * (a permanent claim can no longer be rolled back; before that the
+     * stream stays open so a failed kill leaves the handle readable).
      * <p>
      * Concurrency: safe to call from any thread, including while a wait is
      * blocked. The completion claim, the killed flag and the synthetic -1
@@ -409,14 +436,28 @@ public class CommandHandle implements AutoCloseable {
      * false — the command already finished with its real exit code, which
      * is never overwritten by the synthetic -1) or wins cleanly (the end
      * event's data then overwrites the synthetic code, per "real data
-     * wins"). When the claim wins mid-stream, a stateLock-consistent
-     * snapshot of the killed flag — taken when the wait leaves the read
-     * loop — tells its post-loop branch that this was a local kill, not a
-     * stream failure: the wait returns the synthetic -1 instead of
-     * throwing the misleading "no end event" error. The kill RPC runs
-     * outside the lock; if it throws, the claim is rolled back so the
-     * handle stays usable (unless a real end event completed it meanwhile —
-     * its data wins). Only one of N concurrent kill() calls returns true.
+     * wins"). When the claim wins and the read loop's next frame is not
+     * the end event, a stateLock-consistent snapshot of the killed flag
+     * — taken when the wait leaves the read loop — tells its post-loop
+     * branch that this was a local kill, not a stream failure: the wait
+     * returns the synthetic -1 instead of throwing the misleading "no
+     * end event" error. The kill RPC runs
+     * outside the lock; if it throws — a transport failure, or the
+     * process being gone so no signal was sent (HTTP 404, surfaced like
+     * the Go handleKill's real boolean) — the claim is rolled back so
+     * the handle stays usable for a retry (unless a real end event
+     * completed it meanwhile — its data wins). Only one of N
+     * concurrent kill() calls returns true; kill() returns true only
+     * when the signal was sent.
+     *
+     * @return true when the signal was sent; false when the command had
+     *         already completed
+     * @throws IllegalStateException if envd reports the process is gone
+     *         (HTTP 404): no signal was sent and the completion claim is
+     *         rolled back, so the handle stays usable for a retry. Callers
+     *         that release the handle manually should prefer
+     *         try-with-resources (or a finally block) so the stream is
+     *         still closed when this throws.
      */
     public boolean kill() {
         synchronized (stateLock) {
@@ -440,12 +481,14 @@ public class CommandHandle implements AutoCloseable {
         if (killAction != null) {
             try {
                 killAction.run();
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | Error e) {
                 // Roll the claim back so a failed kill leaves the handle
                 // usable for a retry; when a real end event completed the
                 // handle meanwhile, its data wins and the claim stays.
                 // (exitCode keeps the synthetic -1 on this path — identical
                 // to its initial value, so nothing observable changes.)
+                // Errors roll back too: an Error escaping the kill action
+                // must not strand the claim with no kill delivered.
                 synchronized (stateLock) {
                     if (!sawEndEvent) {
                         completed.set(false);
@@ -454,6 +497,14 @@ public class CommandHandle implements AutoCloseable {
                 }
                 throw e;
             }
+        }
+        // The claim is permanent now — nothing can roll it back anymore,
+        // so the entry fast path of waitForCompletion() may close the
+        // stream (see killConfirmed). Written under stateLock so a
+        // concurrent waitForCompletion() entering the fast path after
+        // completed.get() == true is guaranteed to observe the flag.
+        synchronized (stateLock) {
+            killConfirmed = true;
         }
         return true;
     }

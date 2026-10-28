@@ -114,7 +114,7 @@ Sandbox sandbox=api.create("code-interpreter");
 ## 2. Command Execution (Commands)
 
 Operate on processes inside the container via `sandbox.commands`. Built on OkHttp + Connect Protocol; commands are
-executed through `/bin/bash -l -c <cmd>`.
+executed through `<shell> -l -c <cmd>` (default shell `/bin/bash`, configurable via `RunOptions.shell()`).
 
 ### Methods
 
@@ -173,7 +173,7 @@ Returned by `runBackground()` / `connect()`, implements `AutoCloseable`:
 | `getPid()`            | Returns process PID                             |
 | `isCompleted()`       | Whether the process has completed               |
 | `waitForCompletion()` | Block until completion, returns `CommandResult`; throws `CommandExitException` (carrying the result) when the exit code is non-zero |
-| `kill()`              | Kill the process                                |
+| `kill()`              | Kill the process; throws `IllegalStateException` when envd reports it is already gone (no signal sent, the completion claim is rolled back) |
 | `disconnect()`        | Stop reading output without killing the process; a blocked `waitForCompletion()` fails with an exception |
 | `close()`             | Close stream and underlying resources           |
 
@@ -188,11 +188,12 @@ CommandResult res=sandbox.commands.run("pwd");
     CommandResult res2=sandbox.commands.run("ls -la /tmp",
     new RunOptions().cwd("/tmp").onStdout(System.out::print));
 
-    // Background + manual kill
-    CommandHandle handle=sandbox.commands.runBackground("sleep 60",new RunOptions());
-    System.out.println("pid = "+handle.getPid());
-    handle.kill();
-    handle.close();
+    // Background + manual kill — try-with-resources releases the stream even
+    // when kill() throws because the process is already gone
+    try (CommandHandle handle=sandbox.commands.runBackground("sleep 60",new RunOptions())) {
+        System.out.println("pid = "+handle.getPid());
+        handle.kill();
+    }
 
     // List processes
     List<ProcessInfo> procs=sandbox.commands.list();

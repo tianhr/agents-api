@@ -130,16 +130,38 @@ this file. The format is based on [Keep a Changelog](https://keepachangelog.com/
   the synthetic code are written under a lock shared with the end-event
   branch: a kill racing the final end event either loses cleanly (returns
   false and keeps the real exit code) or wins cleanly (a real end event
-  arriving afterwards still overwrites the synthetic code), and a wait
-  unblocked by the claim returns the synthetic exit code -1 — the one
-  case where a stream that ended without an end event does not fail
-  loudly. Only one of N concurrent kill() calls returns true, and a
-  failed kill RPC rolls the claim back so the handle stays usable for a
-  retry. Intentional divergence from Go: `CommandHandle.Kill()` in the Go
-  SDK does not claim completion, so a subsequent `Wait` reads the real
-  end event and fails with `CommandExitError` (e.g. code 137); the Java
-  kill reports the synthetic -1 immediately, unblocking the waiter
-  without waiting for envd's end event.
+  arriving afterwards still overwrites the synthetic code). The claim
+  does not cancel the stream: a blocked wait is released by the next
+  frame or the stream end — normally envd's end event for the killed
+  process, whose real exit code (e.g. 137) wins and throws
+  `CommandExitException` like any non-zero end event. The synthetic -1
+  is returned only when the stream ends with no end event while the
+  claim is active — the one case where a stream that ended without an
+  end event does not fail loudly; if the stream never yields another
+  frame (envd stall or crash, a dropped connection), the blocked wait
+  stays blocked unless `timeoutMs` bounds it. Only one of N concurrent
+  kill() calls returns true, and a failed kill RPC rolls the claim
+  back so the handle stays usable for a retry (an `Error` thrown in
+  the same window rolls back too). A kill that finds no process to
+  signal (envd's 404) now surfaces as an `IllegalStateException`
+  ("Process <pid> not found; no signal was sent") and rolls the claim
+  back instead of silently claiming completion. This reports the same
+  real outcome the Go `handleKill` does, but not with the same calling
+  contract: Go's `CommandHandle.Kill()` returns `false` and leaves the
+  handle untouched, while Java throws so the caller cannot miss it, and
+  rolls the claim back so the handle stays usable for a retry. Once the
+  kill RPC settles successfully the claim is permanent, and a
+  `waitForCompletion()` returning from
+  the kill-then-wait fast path now releases the output stream instead
+  of pinning the OkHttp connection until GC. Intentional divergence
+  from Go: `CommandHandle.Kill()` in the Go SDK does not claim
+  completion, so any subsequent `Wait` reads the
+  real end event and fails with `CommandExitError` (e.g. code 137).
+  The Java claim mainly changes what a `waitForCompletion()` call made
+  after `kill()` sees — it returns the synthetic -1 immediately from
+  the entry fast path instead of waiting for envd's end event; a wait
+  already blocked when the claim lands is normally still released by
+  that end event and reports the real code.
 - Go/Java: timeout messages now name the source of the timeout
   (per-call option vs client-level fallback), and a caller's own
   context deadline expiring is no longer misattributed to
@@ -180,7 +202,10 @@ this file. The format is based on [Keep a Changelog](https://keepachangelog.com/
 - Java: a mid-stream server error delivered in the Connect Protocol
   end-of-stream trailer now surfaces in `waitForCompletion()` as
   `Command stream failed: <server error>` instead of the misleading
-  `Command ended without an end event`. The same trailer check now also
+  `Command ended without an end event` — with the message extracted
+  from the trailer's `error.message` JSON field rather than reported
+  as the raw JSON payload (a trailer without the expected shape falls
+  back to the raw text). The same trailer check now also
   covers a server error delivered during connect stream setup:
   `connect()` reports `Failed to connect to process: <server error>`
   instead of the generic `no response from server` (the start path
@@ -207,6 +232,12 @@ this file. The format is based on [Keep a Changelog](https://keepachangelog.com/
   returned a synthetic exit-code -1 result, swallowing the real stream
   failure. The official SDKs likewise let the stream error take
   priority over any result.
+- Java: both SDK modules (runtime/java and its embedded copy in
+  e2b/java) compile out of the box on modern JDKs again. The generated
+  gRPC stubs reference `javax.annotation.Generated`, removed from the
+  JDK since 11; the poms now carry `javax.annotation-api` (provided
+  scope), so the 1.8 bytecode target builds on JDK 9+ without the
+  end-user adding the dependency.
 - Java: the end event's server-side error message is no longer dropped.
   The generated proto carries `EndEvent.error` (envd reports e.g. spawn
   failures there) and the official SDKs preserve it (Python
@@ -241,6 +272,13 @@ this file. The format is based on [Keep a Changelog](https://keepachangelog.com/
   side tracks a `disconnected` flag and fails with the explicit
   `Command stream disconnected; the process may still be running in the
   sandbox`. A future fix would add the same flag to the Go handle.
+- Go: the `kill()` closure behind `CommandHandle.Kill()` detaches the
+  context via `context.WithoutCancel` so the RPC survives stream
+  cancellation. `WithoutCancel` also strips all context values, so
+  trace spans propagated through the context do not reach the kill
+  RPC — the signal is still delivered (auth headers come from the
+  client, not the context). A future fix would snapshot and re-attach
+  the values on the detached context.
 - The streaming client does not yet send the official SDK's
   `Keepalive-Ping-Interval` header. Without periodic keepalive frames, an
   idle output stream (a long-running command producing no output) may be

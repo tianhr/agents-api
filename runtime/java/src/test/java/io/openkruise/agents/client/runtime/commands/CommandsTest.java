@@ -136,6 +136,10 @@ public class CommandsTest {
         final List<String> requestPaths = Collections.synchronizedList(new ArrayList<String>());
         /** When set, /SendSignal answers 500 so the kill RPC fails. */
         volatile boolean failSignal;
+        /** When set, /SendSignal answers 404 (no process to signal), so
+         * the kill action must surface the outcome instead of silently
+         * claiming completion. */
+        volatile boolean signalNotFound;
         /** Counts down when a /SendSignal (kill) request arrives, so a
          * streaming script can stage "what the server sends after the
          * kill" frames. */
@@ -151,7 +155,9 @@ public class CommandsTest {
                 exchange.getRequestBody().close();
                 if (path.endsWith("/SendSignal")) {
                     signalReceived.countDown();
-                    if (failSignal) {
+                    if (signalNotFound) {
+                        exchange.sendResponseHeaders(404, -1);
+                    } else if (failSignal) {
                         exchange.sendResponseHeaders(500, -1);
                     } else {
                         exchange.sendResponseHeaders(200, -1);
@@ -219,37 +225,43 @@ public class CommandsTest {
             exchange.close();
         }
 
-        /** Sends the beforeKill frames, flushes them, then blocks until a
-         * kill RPC arrives — by then a waiter is provably hanging inside
-         * the read loop (it consumed the beforeKill frames via its stdout
-         * callback) — then sends the late data frame the waiter is
-         * processing when the kill claim lands, and, after a pause, the
-         * end event the waiter must never read (the claim already broke
-         * the loop and closed the stream; writing to it just ends the
-         * server side). */
+        /** Sends the beforeKill frames, flushes them, blocks until a kill
+         * RPC arrives, then sends the afterKill frames and ends the stream
+         * with no end event.
+         * <p>
+         * Deliberately free of timing margins. The test gates kill() on the
+         * stdout callback of the last beforeKill frame, and
+         * processResponse appends to stdout before running that callback,
+         * so every frame the test asserts on is provably collected before
+         * the completion claim exists. Which of the afterKill frames the
+         * waiter still reads depends on whether the claim landed before or
+         * after the read loop's post-frame check — a window no latch can
+         * order — so the test asserts only what holds under every
+         * interleaving. Ending the stream with no end event keeps a real
+         * exit code from overwriting the synthetic one, which is what the
+         * previous 400ms pause tried to hold back by force. */
         void respondAfterKillSignal(HttpExchange exchange, byte[][] beforeKillFrames,
-                                    byte[] lateData, byte[] endFrame) throws IOException {
+                                    byte[]... afterKillFrames) throws IOException {
             exchange.getResponseHeaders().set("Content-Type", "application/connect+proto");
             exchange.sendResponseHeaders(200, 0);
             OutputStream out = exchange.getResponseBody();
-            for (byte[] frame : beforeKillFrames) {
-                out.write(frame);
-            }
-            out.flush();
             try {
-                signalReceived.await();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            out.write(lateData);
-            out.flush();
-            try {
-                Thread.sleep(400);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            try {
-                out.write(endFrame);
+                for (byte[] frame : beforeKillFrames) {
+                    out.write(frame);
+                }
+                out.flush();
+                try {
+                    // Bounded like respondAfterLatch: a regression that never
+                    // sends the kill RPC must fail the assertions, not hang
+                    // server.stop(0) on a blocked handler.
+                    signalReceived.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                for (byte[] frame : afterKillFrames) {
+                    out.write(frame);
+                }
+                out.flush();
                 out.close();
             } catch (IOException ignored) {
                 // The client closed the stream when the kill claim broke the
@@ -627,8 +639,8 @@ public class CommandsTest {
                 commands.connect(42, new Commands.ConnectOptions());
                 fail("expected the trailer error to fail connect()");
             } catch (SandboxException e) {
-                assertTrue("expected the server error surfaced, got: " + e.getMessage(),
-                    e.getMessage().contains("envd connect exploded"));
+                assertTrue("expected the extracted server message, not the raw trailer JSON, got: " + e.getMessage(),
+                    e.getMessage().contains("envd connect exploded") && !e.getMessage().contains("\"error\""));
             }
         }
     }
@@ -730,8 +742,8 @@ public class CommandsTest {
                 handle.waitForCompletion();
                 fail("expected the trailer error to fail waitForCompletion()");
             } catch (SandboxException e) {
-                assertTrue("expected the server error surfaced, got: " + e.getMessage(),
-                    e.getMessage().contains("envd exploded"));
+                assertTrue("expected the extracted server message, not the raw trailer JSON, got: " + e.getMessage(),
+                    e.getMessage().contains("envd exploded") && !e.getMessage().contains("\"error\""));
             }
         }
     }
@@ -796,27 +808,61 @@ public class CommandsTest {
     }
 
     @Test(timeout = 15000)
+    public void killNotFoundSurfacesAndRollsBack() throws Exception {
+        // A 404 from SendSignal means no process was there to signal —
+        // previously the boolean was discarded and kill() reported true,
+        // claiming completion with no kill delivered (and a wait on a
+        // silent stream then stayed blocked forever). The kill action now
+        // surfaces it, and the handle's kill() rolls the claim back so the
+        // handle stays usable — mirroring the Go handleKill's real
+        // boolean.
+        try (MockEnvd envd = MockEnvd.start((server, exchange, path) ->
+            server.respondThenBlock(exchange, dataFrame(startEvent(42))))) {
+            Commands commands = commandsFor(envd, 60_000L);
+            CommandHandle handle = commands.runBackground("sleep 60", new Commands.RunOptions());
+            envd.signalNotFound = true;
+            try {
+                handle.kill();
+                fail("expected the 404 kill to surface");
+            } catch (IllegalStateException e) {
+                assertTrue("expected the no-signal message, got: " + e.getMessage(),
+                    e.getMessage().contains("no signal was sent"));
+            }
+            assertFalse("the claim must roll back when no signal was sent",
+                handle.isCompleted());
+        }
+    }
+
+    @Test(timeout = 15000)
     public void killDuringBlockedWaitReturnsSyntheticResult() throws Exception {
         // The concurrency gap the state lock alone did not cover: kill()
-        // claims completion while a wait is blocked, and the next frame the
-        // wait processes is a DATA frame (not the end event). The wait must
-        // break on the claim and return the synthetic -1 via the killed
-        // flag — not throw the misleading sticky "no end event" failure,
-        // which also meant the late end event (real exit code 137) was
-        // never read. The waiter finishes the frame it is processing, so
-        // the late output is still collected before the break.
+        // claims completion while a wait is blocked in the read loop. The
+        // wait must return the synthetic -1 via the killed flag — not throw
+        // the misleading sticky "no end event" failure, which also meant a
+        // later real end event was never read.
+        //
+        // No assertion here depends on a thread interleaving or on a sleep.
+        // processResponse appends to stdout before invoking the onStdout
+        // callback, so gating kill() on the callback of the last pre-kill
+        // frame proves that frame is already collected and that the waiter
+        // is inside the read loop (not on the entry fast path). Which branch
+        // the loop then leaves by — breaking on the claim at that frame's
+        // post-check, reading a post-kill frame first, or finding the stream
+        // ended — is a nanosecond window no latch can order, and all of them
+        // must yield the same synthetic result. The stream ends with no end
+        // event, so the real exit code can never win against the claim.
         try (MockEnvd envd = MockEnvd.start((server, exchange, path) ->
             server.respondAfterKillSignal(exchange,
-                new byte[][]{dataFrame(startEvent(42)), dataFrame(stdoutData("in-loop"))},
-                dataFrame(stdoutData("late-output")),
-                dataFrame(endEvent(137))))) {
+                new byte[][]{dataFrame(startEvent(42)), dataFrame(stdoutData("in-loop")),
+                    dataFrame(stdoutData("pre-kill"))},
+                dataFrame(stdoutData("post-kill"))))) {
             Commands commands = commandsFor(envd, 60_000L);
-            // The waiter counts this down from its stdout callback once it
-            // has consumed the in-loop frame — proving it is blocked inside
-            // the read loop (not on the entry fast path) when kill() lands.
+            // Counted down from the stdout callback of the last pre-kill
+            // frame: by then that frame is in the stdout buffer and the
+            // waiter is provably inside the read loop.
             final CountDownLatch waiterInLoop = new CountDownLatch(1);
             CommandHandle handle = commands.runBackground("sleep 60", new Commands.RunOptions()
-                .onStdout(s -> { if (s.contains("in-loop")) { waiterInLoop.countDown(); } }));
+                .onStdout(s -> { if (s.contains("pre-kill")) { waiterInLoop.countDown(); } }));
 
             final AtomicReference<CommandResult> waiterResult = new AtomicReference<>();
             final AtomicReference<Exception> waiterError = new AtomicReference<>();
@@ -830,6 +876,9 @@ public class CommandsTest {
             waiter.start();
 
             assertTrue("waiter never reached the read loop", waiterInLoop.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            // No sleep between the latch and the claim: everything asserted
+            // below holds whether or not the claim beats the waiter's next
+            // stateLock check.
             assertTrue("kill() must claim the handle while the wait is blocked", handle.kill());
             waiter.join(5000);
 
@@ -838,19 +887,46 @@ public class CommandsTest {
             assertNotNull("the blocked wait must return a result", waiterResult.get());
             assertEquals("a wait unblocked by the kill claim returns the synthetic code",
                 -1, waiterResult.get().getExitCode());
-            assertTrue("the frame in flight when the claim landed is still collected",
-                waiterResult.get().getStdout().contains("late-output"));
+            assertTrue("frames consumed before the claim are kept",
+                waiterResult.get().getStdout().contains("in-loop")
+                    && waiterResult.get().getStdout().contains("pre-kill"));
             // No sticky failure was recorded — the same synthetic result
             // replays on the next call instead of an exception.
             assertEquals(-1, handle.waitForCompletion().getExitCode());
         }
     }
 
+    /** Blocks until the waiter thread is parked inside
+     * ConnectStreamReader.hasNext() — past every completion check the read
+     * loop makes, waiting for a frame that cannot arrive until the test
+     * releases it. A stdout callback cannot establish this: it fires inside
+     * processResponse, before the loop's post-frame check, so a claim
+     * landing in that window makes the waiter break on the claim and skip
+     * the staged frames — a legal outcome, but not what a test about the
+     * blocked-wait path may assert on. Matching our own class and method
+     * (not a JDK frame) keeps this a real happens-before rather than a
+     * timing margin. Bounded: a waiter that never parks must fail the
+     * assertions, not hang the test. */
+    private static void awaitParkedInHasNext(Thread waiter) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000L;
+        while (System.currentTimeMillis() < deadline) {
+            for (StackTraceElement frame : waiter.getStackTrace()) {
+                if ("hasNext".equals(frame.getMethodName())
+                    && frame.getClassName().endsWith("ConnectStreamReader")) {
+                    return;
+                }
+            }
+            Thread.sleep(1);
+        }
+        fail("waiter never parked inside ConnectStreamReader.hasNext(); last stack: "
+            + java.util.Arrays.toString(waiter.getStackTrace()));
+    }
+
     @Test(timeout = 15000)
     public void failedKillLeavesBlockedWaitReadingTheRealEndEvent() throws Exception {
-        // The rollback side of the kill claim, with a waiter provably
-        // blocked in the read loop (failedKillRollsBackCompletionClaim is
-        // sequential): the failed kill RPC rolls killed/completed back, so
+        // The rollback side of the kill claim, with the waiter parked inside
+        // hasNext() before the claim is made (failedKillRollsBackCompletionClaim
+        // is sequential): the failed kill RPC rolls killed/completed back, so
         // the waiter must keep reading — collecting the late data frame and
         // the real end event (exit code 137) — instead of stranding on a
         // claim that no longer exists, returning the synthetic -1, or
@@ -883,6 +959,11 @@ public class CommandsTest {
             waiter.start();
 
             assertTrue("waiter never reached the read loop", waiterInLoop.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            // The callback above only proves the frame was consumed; park the
+            // waiter in hasNext() so the claim cannot land inside the window
+            // before its post-frame check. Nothing can arrive until
+            // rollbackDone is released, so from here the order is forced.
+            awaitParkedInHasNext(waiter);
             envd.failSignal = true;
             try {
                 handle.kill();

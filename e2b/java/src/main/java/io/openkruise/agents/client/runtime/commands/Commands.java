@@ -320,14 +320,18 @@ public class Commands {
             }
         }
 
-        return new CommandHandle(pid, streamReader, response, () -> kill((int) pid),
-            call::cancel, options.getOnStdout(), options.getOnStderr())
-            // Pass the armed call timeout and the call's canceled state so
-            // waitForCompletion can attribute a stream cut by it to
-            // RunOptions.timeoutMs (structural detection via isCanceled,
-            // not error-text matching).
-            .withTimeoutMs(options.getTimeoutMs(), "RunOptions.timeoutMs")
-            .withCallCanceled(call::isCanceled);
+        CommandHandle handle = new CommandHandle(pid, streamReader, response,
+            () -> killOrThrow((int) pid),
+            call::cancel, options.getOnStdout(), options.getOnStderr());
+        // Pass the armed call timeout and the call's canceled state so
+        // waitForCompletion can attribute a stream cut by it to
+        // RunOptions.timeoutMs (structural detection via isCanceled,
+        // not error-text matching). Ownership transfers to the caller via
+        // the return below; the handle stays open as the caller's
+        // AutoCloseable.
+        handle.withTimeoutMs(options.getTimeoutMs(), "RunOptions.timeoutMs");
+        handle.withCallCanceled(call::isCanceled);
+        return handle;
     }
 
     public void sendInput(int pid, String data) {
@@ -358,6 +362,19 @@ public class Commands {
 
     public boolean kill(int pid) {
         return sendSignal(pid, Signal.SIGNAL_SIGKILL);
+    }
+
+    /** Kill action for CommandHandle: sends SIGKILL, surfacing envd's
+     * "process not found" (HTTP 404, kill returning false) as an
+     * IllegalStateException so CommandHandle.kill rolls its completion
+     * claim back and the handle stays usable for a retry — the same real
+     * outcome the Go handleKill reports with its boolean. Called lazily
+     * when the handle's kill() runs, never at construction time. */
+    private void killOrThrow(int pid) {
+        if (!kill(pid)) {
+            throw new IllegalStateException(
+                "Process " + pid + " not found; no signal was sent");
+        }
     }
 
     public boolean sendSignal(int pid, Signal signal) {
@@ -558,14 +575,18 @@ public class Commands {
             MessageStream<StartResponse> adaptedReader =
                 new ConnectResponseAdapter(connectReader, response);
 
-            return new CommandHandle(pid, adaptedReader, response, () -> kill(pid),
-                call::cancel, null, null)
-                // Pass the armed call timeout and the call's canceled state
-                // so waitForCompletion can attribute a stream cut by it to
-                // ConnectOptions.timeoutMs (structural detection via
-                // isCanceled, not error-text matching).
-                .withTimeoutMs(options.getTimeoutMs(), "ConnectOptions.timeoutMs")
-                .withCallCanceled(call::isCanceled);
+            CommandHandle handle = new CommandHandle(pid, adaptedReader, response,
+                () -> killOrThrow(pid),
+                call::cancel, null, null);
+            // Pass the armed call timeout and the call's canceled state
+            // so waitForCompletion can attribute a stream cut by it to
+            // ConnectOptions.timeoutMs (structural detection via
+            // isCanceled, not error-text matching). Ownership transfers
+            // to the caller via the return below; the handle stays open
+            // as the caller's AutoCloseable.
+            handle.withTimeoutMs(options.getTimeoutMs(), "ConnectOptions.timeoutMs");
+            handle.withCallCanceled(call::isCanceled);
+            return handle;
         } finally {
             // Close exactly once on every failure path — including an
             // unexpected exception escaping the block above; on success the

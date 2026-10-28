@@ -381,9 +381,10 @@ func TestStartRequestTimeoutDisarmedAfterStartEvent(t *testing.T) {
 		_, _ = w.Write(frames)
 		w.(http.Flusher).Flush()
 
-		// Stay silent longer than the request timeout: the watchdog must
+		// Stay silent far longer than the request timeout (generous
+		// margin for a loaded CI): the watchdog must
 		// have been disarmed by the start event above.
-		time.Sleep(400 * time.Millisecond)
+		time.Sleep(2 * time.Second)
 		rest, err := connectFrames(endEvent(0))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
