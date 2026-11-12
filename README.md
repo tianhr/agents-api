@@ -13,7 +13,7 @@ We recommend using the go types in this repo. You may serialize them directly to
 * The `client` package contain the go clientset to access Kruise Agents API.
 * The `agents` packages contain api definition in go
 * The `k8s` contain k8s clients in other languages including Python and Java
-* The `e2b` contain e2b clients in Golang
+* The `e2b` contain e2b clients in Golang test
 * The `runtime` contain golang clients to access agent-runtime directly (command and file operations)
 
 ## Documentation
