@@ -3,6 +3,7 @@ package io.openkruise.agents.client.e2b;
 import io.openkruise.agents.client.e2b.api.SandboxesApi;
 import io.openkruise.agents.client.e2b.api.invoker.ApiClient;
 import io.openkruise.agents.client.runtime.RuntimeConfig;
+import io.openkruise.agents.client.runtime.TrafficTokenProvider;
 import io.openkruise.agents.client.url.E2BURLBuilder;
 import io.openkruise.agents.client.url.URLBuilder;
 import okhttp3.OkHttpClient;
@@ -103,6 +104,17 @@ public class ConnectionConfig {
      * Convert ConnectionConfig to RuntimeConfig for data plane operations.
      */
     public static RuntimeConfig toRuntimeConfig(ConnectionConfig connectionConfig, String envdAccessToken) {
+        return toRuntimeConfig(connectionConfig, envdAccessToken, null);
+    }
+
+    /**
+     * Convert ConnectionConfig to RuntimeConfig for data plane operations,
+     * installing a traffic token provider so data-plane requests carry the
+     * {@code e2b-traffic-access-token} header (JWT-protected sandboxes). Pass a
+     * {@code null} provider for the legacy behavior (no traffic token header).
+     */
+    public static RuntimeConfig toRuntimeConfig(ConnectionConfig connectionConfig, String envdAccessToken,
+        TrafficTokenProvider trafficTokenProvider) {
         if (connectionConfig == null) {
             throw new IllegalArgumentException("connectionConfig cannot be null");
         }
@@ -141,7 +153,33 @@ public class ConnectionConfig {
         // Pass custom HTTP client
         builder.httpClient(connectionConfig.getHttpClient());
 
+        // Install the traffic token provider so data-plane requests carry the
+        // e2b-traffic-access-token header when the sandbox is JWT-protected.
+        builder.trafficTokenProvider(trafficTokenProvider);
+
         return builder.build();
+    }
+
+    /**
+     * Management API base used for traffic access token refreshes. The upstream
+     * sandbox-manager registers the refresh endpoint only under its
+     * {@code /kruise/api} prefix (never on the native {@code https://api.<domain>}
+     * path), so -- mirroring the Python patch, whose {@code api_url} always
+     * carries the {@code /kruise/api} prefix -- this base is constant across
+     * routing protocols: {@code {scheme}://{domain}/kruise/api}. An explicit
+     * {@code apiURL} override wins as-is (the escape hatch for proxies and
+     * port-forwarding; point it at a URL that serves the refresh path), with a
+     * trailing slash trimmed so the refresh path never contains a double slash.
+     */
+    public String getTrafficAPIBase() {
+        if (apiURL != null && !apiURL.isEmpty()) {
+            int end = apiURL.length();
+            while (end > 0 && apiURL.charAt(end - 1) == '/') {
+                end--;
+            }
+            return apiURL.substring(0, end);
+        }
+        return String.format("%s://%s/kruise/api", getSchemeOrDefault(), domain);
     }
 
     /** API base URL, automatically selects NATIVE/PRIVATE format based on protocol. */

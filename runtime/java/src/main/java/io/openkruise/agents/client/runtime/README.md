@@ -139,6 +139,7 @@ routing is involved.
 | `.codeInterpreterPort(int)`     | Code interpreter port, default 49999                                               |
 | `.urlBuilder(URLBuilder)`       | URL builder, supports E2B and Runtime modes                                        |
 | `.httpClient(OkHttpClient)`     | Custom OkHttpClient for all HTTP requests (proxy, SSL, timeouts, etc.)             |
+| `.trafficTokenProvider(TrafficTokenProvider)` | Supplies the `e2b-traffic-access-token` header value on every data-plane request; returning `""` sends no header (legacy). See [Traffic Token Provider](#traffic-token-provider) below |
 
 ### Priority
 
@@ -174,6 +175,26 @@ try (RuntimeClient client = RuntimeClient.create("sandbox-id", config)) {
 ```
 
 **Note**: When `httpClient` is provided, it is used directly for all HTTP requests. The streaming client is derived from it with `readTimeout=0` for long-running operations.
+
+### Traffic Token Provider
+
+`.trafficTokenProvider(TrafficTokenProvider)` installs a hook that supplies a **Traffic JWT** for JWT-protected
+sandboxes. Before every data-plane request (Commands / Filesystem / CodeInterpreter) a `TrafficTokenInterceptor`
+(OkHttp application interceptor, added to both the standard and the streaming client) calls `provider.get()` and,
+when the returned token is non-empty, attaches it as the `e2b-traffic-access-token` header:
+
+```java
+RuntimeConfig config = new RuntimeConfig.Builder()
+    .domain("sandbox-gateway.sandbox-system.svc:7788")
+    .scheme("http")
+    .trafficTokenProvider(() -> myTokenSource.currentToken()) // "" -> no header (legacy)
+    .build();
+```
+
+`TrafficTokenProvider` is a functional interface `String get() throws java.io.IOException`. If `get()` throws, the
+exception propagates and the request is **not** sent (fail-closed). The e2b client wires this automatically from its
+`TrafficTokenManager` (transparent refresh, backoff, single-flight coalescing); see the e2b SDK docs for the full
+mechanism. The provider is optional — without one, no traffic header is sent (legacy behavior).
 
 ---
 

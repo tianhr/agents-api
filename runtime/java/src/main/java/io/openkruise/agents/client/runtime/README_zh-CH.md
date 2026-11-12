@@ -139,6 +139,7 @@ try (RuntimeClient client = RuntimeClient.newFromK8s("default", "your-sandbox-na
 | `.codeInterpreterPort(int)`     | 代码解释器端口，默认 49999                            |
 | `.urlBuilder(URLBuilder)`       | URL 构建器，支持 E2B 和 Runtime 模式                 |
 | `.httpClient(OkHttpClient)`     | 自定义 OkHttpClient，用于所有 HTTP 请求（代理、SSL、超时等） |
+| `.trafficTokenProvider(TrafficTokenProvider)` | 为每个数据面请求提供 `e2b-traffic-access-token` 头的取值；返回 `""` 则不发送该头（legacy）。详见下文「Traffic Token Provider」小节 |
 
 ### 优先级
 
@@ -174,6 +175,20 @@ try (RuntimeClient client = RuntimeClient.create("sandbox-id", config)) {
 ```
 
 **注意**：当提供 `httpClient` 时，它将直接用于所有 HTTP 请求。流式客户端会基于它派生，并设置 `readTimeout=0` 以支持长时间运行的操作。
+
+### Traffic Token Provider（流量令牌提供者）
+
+`.trafficTokenProvider(TrafficTokenProvider)` 安装一个为 JWT 保护的 sandbox 提供 **Traffic JWT** 的钩子。每个数据面请求（Commands / Filesystem / CodeInterpreter）发出前，`TrafficTokenInterceptor`（OkHttp application 拦截器，同时加装到标准客户端与流式客户端）会调用 `provider.get()`，当返回的 token 非空时将其作为 `e2b-traffic-access-token` 头附加到请求上：
+
+```java
+RuntimeConfig config = new RuntimeConfig.Builder()
+    .domain("sandbox-gateway.sandbox-system.svc:7788")
+    .scheme("http")
+    .trafficTokenProvider(() -> myTokenSource.currentToken()) // "" -> 不发送该头（legacy）
+    .build();
+```
+
+`TrafficTokenProvider` 是函数式接口 `String get() throws java.io.IOException`。若 `get()` 抛出异常，异常会向上传播且请求**不会**发出（fail-closed）。e2b 客户端会自动用其 `TrafficTokenManager`（透明刷新、退避、并发合并）接线该 provider；完整机制见 e2b SDK 文档。该 provider 为可选项——不设置时不发送任何流量令牌头（legacy 行为）。
 
 ---
 

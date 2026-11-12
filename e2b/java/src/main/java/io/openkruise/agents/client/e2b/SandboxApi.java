@@ -34,7 +34,12 @@ public class SandboxApi {
 
         SandboxResponse resp = lowLevelApi.sandboxesPost(body);
 
-        return new Sandbox(resp.getSandboxID(), resp.getEnvdAccessToken(), config);
+        Sandbox sandbox = new Sandbox(resp.getSandboxID(), resp.getEnvdAccessToken(), config);
+        // Seed the traffic token manager from the create response: a JWT enables
+        // automatic refresh, a legacy opaque token keeps legacy behavior (no
+        // header, no refresh), and an empty token bootstraps on first use.
+        sandbox.installTrafficTokenManager(resp.getTrafficAccessToken());
+        return sandbox;
     }
 
     public Sandbox create(String template) throws ApiException {
@@ -50,7 +55,9 @@ public class SandboxApi {
             body.setTimeout(timeout);
             SandboxResponse resp = lowLevelApi.sandboxesSandboxIDConnectPost(sandboxID, body);
 
-            return new Sandbox(resp.getSandboxID(), resp.getEnvdAccessToken(), config);
+            Sandbox sandbox = new Sandbox(resp.getSandboxID(), resp.getEnvdAccessToken(), config);
+            installTrafficTokenOnConnect(sandbox, resp.getTrafficAccessToken());
+            return sandbox;
         } catch (ApiException e) {
             if (e.getCode() == 404) {
                 throw new SandboxNotFoundException(sandboxID, e);
@@ -61,6 +68,36 @@ public class SandboxApi {
 
     public Sandbox connect(String sandboxID) throws ApiException {
         return connect(sandboxID, 0);
+    }
+
+    /**
+     * Seeds the traffic token manager on connect. A token on the response is used
+     * directly; otherwise, for a non-debug connection, the sandbox metadata is
+     * probed best-effort so an existing JWT-protected sandbox resumes with
+     * automatic refresh even when the connect response carries no token. The
+     * probe is skipped on failure so non-JWT deployments keep working.
+     */
+    private void installTrafficTokenOnConnect(Sandbox sandbox, String trafficAccessToken) {
+        if (trafficAccessToken != null && !trafficAccessToken.isEmpty()) {
+            sandbox.installTrafficTokenManager(trafficAccessToken);
+            return;
+        }
+        if (config.isDebug()) {
+            return;
+        }
+        // No token on the connect response: resume an existing sandbox whose
+        // JWT-protected state may have been issued before this client saw it.
+        // The lookup is best-effort so non-JWT deployments (no traffic token at
+        // all) keep working when getInfo cannot be served.
+        try {
+            SandboxInfo info = getInfo(sandbox.getSandboxID());
+            if (info != null && TrafficTokenManager.requiresTrafficToken(info.getMetadata())) {
+                // Lazy bootstrap: the first data-plane request fetches the token.
+                sandbox.installTrafficTokenManager("");
+            }
+        } catch (ApiException e) {
+            LOG.log(Level.FINE, "Traffic token metadata probe failed for sandbox {0}", sandbox.getSandboxID());
+        }
     }
 
     public List<SandboxInfo> list() throws ApiException {

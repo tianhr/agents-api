@@ -561,3 +561,98 @@ RuntimeConfig config=new RuntimeConfig.Builder()
 ```
 
 See Runtime layer docs: [README](../runtime/README.md) | [Chinese Docs](../runtime/README_zh-CH.md)
+
+---
+
+## 8. Traffic JWT Refresh
+
+When a sandbox is created with metadata `"security.agents.kruise.io/enable-jwt-auth": "true"`, the sandbox-manager
+issues a short-lived **Traffic JWT**. Every data-plane request (Commands / Filesystem / CodeInterpreter) must then
+carry it as the `e2b-traffic-access-token` header, or the gateway rejects the request with 403.
+
+The SDK handles this transparently — **no code change is required on the caller side**:
+
+1. `create` / `connect` install a `TrafficTokenManager` seeded from the management API's `trafficAccessToken`.
+   Connecting to an already-running JWT sandbox whose response carries no token falls back to an `enable-jwt-auth`
+   metadata probe and an empty-token bootstrap (the first data-plane request refreshes).
+2. Every data-plane request obtains a valid token right before it is sent. Tokens are refreshed ahead of expiry
+   (`min(300s, max(60s, validity/5))`, minus a small random jitter to spread refreshes).
+3. Concurrent requests needing a refresh at the same time coalesce into a **single** refresh call (this also holds
+   when the refresh fails: concurrent forced refreshes keep the current token and share one retry).
+4. Failed refreshes retry with exponential backoff (the server `Retry-After` is honored). While the current token is
+   still valid the stale token is used; once it expires the manager **fails closed** and throws
+   `TrafficAccessTokenExpiredException` instead of sending a request that would be rejected.
+5. Injection happens in the runtime layer: a `TrafficTokenInterceptor` (OkHttp application interceptor) on the shared
+   `RuntimeConfig` clients attaches the header to Commands / Filesystem / CodeInterpreter requests. If the provider
+   throws, the request is not sent (fail-closed).
+
+```java
+NewSandbox body = new NewSandbox()
+    .templateID("code-interpreter")
+    .putMetadataItem("security.agents.kruise.io/enable-jwt-auth", "true");
+Sandbox sandbox = api.create(body);
+// ...data-plane calls (commands / files / codeInterpreter) just work —
+// the token is attached and refreshed automatically.
+
+// Optional manual control:
+String token = sandbox.getTrafficAccessToken();       // cached token, no refresh, "" when not JWT-protected
+token = sandbox.refreshTrafficAccessToken();          // forced refresh (concurrent forces coalesce)
+```
+
+### Public API
+
+| Method                                                                                        | Description                                                       |
+|-----------------------------------------------------------------------------------------------|-------------------------------------------------------------------|
+| `String Sandbox.getTrafficAccessToken()`                                                      | Currently cached traffic token (no refresh); `""` when not JWT-protected |
+| `String Sandbox.refreshTrafficAccessToken()` throws `TrafficAccessTokenException`             | Force a refresh; concurrent forced refreshes coalesce              |
+| `static TrafficAccessToken TrafficTokenRefresher.refresh(ConnectionConfig, String sandboxID)` | Low-level: POST the refresh endpoint and return the raw token      |
+| `static String Keys.encodeForE2BSDK(String raw)`                                              | Wrap a raw key into the `e2b_`-prefixed format (see below)         |
+
+### Seed entry points
+
+Java exposes exactly two seed entry points (there is **no** explicit-seed option like Go's `WithTrafficAccessToken`):
+
+- the `trafficAccessToken` on a `create` / `connect` response — a JWT installs the manager, a legacy opaque token
+  keeps legacy behavior, an empty token bootstraps on first use;
+- the `enable-jwt-auth` metadata probe on `connect` (lazy empty-token bootstrap).
+
+To drive an **externally issued** JWT (external identity-provider deployments where the manager does not mint JWTs),
+serve it through the management response — e.g. the translating proxy in `SandboxTrafficJwtExample` injects the issued
+JWT into the create/connect response and routes the refresh endpoint to the external issuer.
+
+Non-JWT sandboxes (no traffic token, legacy opaque tokens) and `debug` mode keep the legacy behavior: no traffic
+header, no refresh, and `refreshTrafficAccessToken()` throws `TrafficAccessTokenException`.
+
+> **Refresh URL (single prefix).** `TrafficTokenRefresher.refresh(config, sandboxID)` POSTs
+> `{config.getTrafficAPIBase()}/sandboxes/{sandboxID}/traffic-access-token`. The upstream sandbox-manager registers
+> this endpoint **only** under its `/kruise/api` prefix, so `getTrafficAPIBase()` always targets
+> `{scheme}://{domain}/kruise/api/...` regardless of the routing protocol (`NATIVE` included) — mirroring the Python
+> patch, whose derived `api_url` always carries the prefix. An explicit `apiURL` override still wins as-is (trailing
+> slash trimmed); point it at a base that serves the refresh path (proxies, port-forwarding).
+
+### Rollout
+
+1. Deploy the OIDC provider and upgrade the sandbox-gateway with `enableJwtAuth=true` (+ discovery URL and provider
+   CA). See the deployment prerequisites in `SandboxTrafficJwtExample`'s header comment.
+2. Opt sandboxes in per-create with the `security.agents.kruise.io/enable-jwt-auth=true` metadata.
+3. No client code change is needed: the SDK attaches and refreshes the token automatically. Sandboxes without the
+   annotation keep the legacy no-header behavior, so the rollout is incremental.
+
+### Verifying against a JWT-enabled gateway
+
+`examples/SandboxTrafficJwtExample.java` is the Java counterpart of the Python `demo_jwt_gateway.py` and the Go
+`examples/jwt-gateway-example`: it runs the complete flow (create → commands.run → run_code → pause → connect →
+automatic rotation → kill) against a sandbox-gateway with `enableJwtAuth=true` and an external OIDC provider. Because
+the OSS sandbox-manager issues opaque UUID tokens and Java has no explicit-seed option, a local translating proxy
+injects the externally issued JWT into the create/connect response and routes the refresh endpoint to the external
+issuer, so the full SDK refresh path — headers, Retry-After handling, response validation — is exercised end to end.
+See the example's header comment for deployment prerequisites and environment variables.
+
+### Key Compatibility Encoding
+
+`Keys.encodeForE2BSDK` wraps a raw (OpenKruise) API key into the format understood by E2B-ecosystem tooling that
+expects `e2b_`-prefixed keys:
+
+```java
+String encoded = Keys.encodeForE2BSDK("my-raw-key"); // e2b_6f6b6167...
+```

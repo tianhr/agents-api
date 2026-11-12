@@ -52,6 +52,24 @@ try (RuntimeClient client = RuntimeClient.newFromK8s("default", "your-sandbox-na
 }
 ```
 
+## Traffic Token Provider
+
+`RuntimeConfig.Builder.trafficTokenProvider(TrafficTokenProvider)` supplies a **Traffic JWT** for JWT-protected
+sandboxes. A `TrafficTokenInterceptor` (OkHttp application interceptor on the shared clients) calls `provider.get()`
+before every data-plane request and attaches a non-empty token as the `e2b-traffic-access-token` header; returning
+`""` sends no header (legacy), and a thrown `IOException` fails closed (the request is not sent).
+
+```java
+RuntimeConfig config = new RuntimeConfig.Builder()
+    .domain("sandbox-gateway.sandbox-system.svc:7788")
+    .scheme("http")
+    .trafficTokenProvider(() -> myTokenSource.currentToken())
+    .build();
+```
+
+The e2b client wires this automatically from its `TrafficTokenManager`; see the
+[runtime docs](src/main/java/io/openkruise/agents/client/runtime/README.md#traffic-token-provider) for details.
+
 ## Documentation
 
 - [English Documentation](src/main/java/io/openkruise/agents/client/runtime/README.md) — Full API reference with

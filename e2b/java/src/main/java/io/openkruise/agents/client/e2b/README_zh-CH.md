@@ -551,3 +551,88 @@ RuntimeConfig config=new RuntimeConfig.Builder()
 ```
 
 详见 Runtime 层文档：[README](../runtime/README.md) | [中文文档](../runtime/README_zh-CH.md)
+
+---
+
+## 八、Traffic JWT 自动刷新
+
+当 sandbox 以 metadata `"security.agents.kruise.io/enable-jwt-auth": "true"` 创建时，sandbox-manager 会签发一个短时效的
+**Traffic JWT**。此后每个数据面请求（Commands / Filesystem / CodeInterpreter）都必须携带它作为 `e2b-traffic-access-token`
+头，否则网关会以 403 拒绝请求。
+
+SDK 透明地处理这一切——**调用方无需改动任何代码**：
+
+1. `create` / `connect` 会用管理面 API 返回的 `trafficAccessToken` 作为种子安装 `TrafficTokenManager`。当连接到一个已在
+   运行、但响应不带 token 的 JWT sandbox 时，会回退到 `enable-jwt-auth` metadata 探测并以空 token 引导（首个数据面请求触发刷新）。
+2. 每个数据面请求在发出前都会取得一个有效 token。token 会在到期前刷新（`min(300s, max(60s, validity/5))`，再减去一个
+   小的随机抖动以分散刷新）。
+3. 同一时刻需要刷新的并发请求会合并为**单次**刷新调用（刷新失败时同样成立：并发的强制刷新会保留当前 token 并共享一次重试）。
+4. 刷新失败会以指数退避重试（尊重服务端 `Retry-After`）。当前 token 仍有效时沿用旧 token；一旦过期，manager 会
+   **fail-closed**，抛出 `TrafficAccessTokenExpiredException`，而不是发出一个注定被拒绝的请求。
+5. 注入发生在 runtime 层：共享 `RuntimeConfig` 客户端上的 `TrafficTokenInterceptor`（OkHttp application 拦截器）为
+   Commands / Filesystem / CodeInterpreter 请求附加该头。若 provider 抛出异常，请求不会发出（fail-closed）。
+
+```java
+NewSandbox body = new NewSandbox()
+    .templateID("code-interpreter")
+    .putMetadataItem("security.agents.kruise.io/enable-jwt-auth", "true");
+Sandbox sandbox = api.create(body);
+// ...数据面调用（commands / files / codeInterpreter）开箱即用——
+// token 会被自动附加并刷新。
+
+// 可选的手动控制：
+String token = sandbox.getTrafficAccessToken();       // 缓存的 token，不刷新；非 JWT 保护时为 ""
+token = sandbox.refreshTrafficAccessToken();          // 强制刷新（并发强制刷新会合并）
+```
+
+### 公开 API
+
+| 方法                                                                                          | 说明                                    |
+|---------------------------------------------------------------------------------------------|---------------------------------------|
+| `String Sandbox.getTrafficAccessToken()`                                                    | 当前缓存的流量 token（不刷新）；非 JWT 保护时为 `""`     |
+| `String Sandbox.refreshTrafficAccessToken()` throws `TrafficAccessTokenException`           | 强制刷新；并发的强制刷新会合并                 |
+| `static TrafficAccessToken TrafficTokenRefresher.refresh(ConnectionConfig, String sandboxID)` | 底层：POST 刷新端点并返回原始 token          |
+| `static String Keys.encodeForE2BSDK(String raw)`                                            | 将原始 key 包装为 `e2b_` 前缀格式（见下文）      |
+
+### 种子入口
+
+Java 只暴露两个种子入口（**没有**类似 Go `WithTrafficAccessToken` 的显式种子选项）：
+
+- `create` / `connect` 响应上的 `trafficAccessToken`——JWT 会安装 manager，legacy 不透明 token 保持 legacy 行为，空 token
+  在首次使用时引导；
+- `connect` 时的 `enable-jwt-auth` metadata 探测（懒加载空 token 引导）。
+
+若要驱动**外部签发**的 JWT（manager 不签发 JWT 的外部身份提供方部署），需通过管理面响应提供——例如 `SandboxTrafficJwtExample` 中的
+翻译代理会把签发的 JWT 注入 create/connect 响应，并把刷新端点路由到外部签发方。
+
+非 JWT sandbox（无流量 token、legacy 不透明 token）与 `debug` 模式保持 legacy 行为：不发送流量头、不刷新，且 `refreshTrafficAccessToken()`
+会抛出 `TrafficAccessTokenException`。
+
+> **刷新 URL（单前缀）。** `TrafficTokenRefresher.refresh(config, sandboxID)` 会 POST
+> `{config.getTrafficAPIBase()}/sandboxes/{sandboxID}/traffic-access-token`。上游 sandbox-manager **仅**在其
+> `/kruise/api` 前缀下注册该端点，因此 `getTrafficAPIBase()` 恒定指向 `{scheme}://{domain}/kruise/api/...`，与路由协议无关
+> （含 `NATIVE`）——这与 Python 补丁一致（其推导出的 `api_url` 始终带该前缀）。显式的 `apiURL` 覆盖仍原样优先（去尾斜杠）；请把它指向一个
+> 能提供刷新路径的 base（代理、端口转发）。
+
+### 上线（Rollout）
+
+1. 部署 OIDC provider，并以 `enableJwtAuth=true`（+ discovery URL 与 provider CA）升级 sandbox-gateway。参见
+   `SandboxTrafficJwtExample` 头注释中的部署前置条件。
+2. 创建时以 `security.agents.kruise.io/enable-jwt-auth=true` metadata 逐个为 sandbox 开启。
+3. 无需改动客户端代码：SDK 会自动附加并刷新 token。未带该注解的 sandbox 保持 legacy 无头行为，因此上线可渐进推进。
+
+### 对着 JWT 网关验证
+
+`examples/SandboxTrafficJwtExample.java` 是 Python `demo_jwt_gateway.py` 与 Go `examples/jwt-gateway-example` 的 Java
+对应实现：它对着一个 `enableJwtAuth=true` 的 sandbox-gateway 与外部 OIDC provider 跑完整流程（create → commands.run →
+run_code → pause → connect → 自动轮换 → kill）。由于 OSS sandbox-manager 签发的是不透明 UUID token、且 Java 没有显式种子选项，
+一个本地翻译代理会把外部签发的 JWT 注入 create/connect 响应，并把刷新端点路由到外部签发方，从而端到端地走通完整的 SDK 刷新路径——请求头、
+Retry-After 处理、响应校验。部署前置条件与环境变量见该示例的头注释。
+
+### Key 兼容编码
+
+`Keys.encodeForE2BSDK` 把原始（OpenKruise）API key 包装为 E2B 生态工具所识别的、期望 `e2b_` 前缀的格式：
+
+```java
+String encoded = Keys.encodeForE2BSDK("my-raw-key"); // e2b_6f6b6167...
+```

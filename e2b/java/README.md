@@ -54,6 +54,7 @@ try (sandbox) {
 - [Run as User](src/main/java/io/openkruise/agents/client/examples/SandboxRunAsUserExample.java)
 - [Files](src/main/java/io/openkruise/agents/client/examples/SandboxFilesExample.java)
 - [Code Interpreter](src/main/java/io/openkruise/agents/client/examples/SandboxCodeInterpreterExample.java)
+- [Traffic JWT](src/main/java/io/openkruise/agents/client/examples/SandboxTrafficJwtExample.java)
 
 ## Environment Variables
 
@@ -61,3 +62,25 @@ try (sandbox) {
 |---------------|---------------------------------------------|
 | `E2B_API_KEY` | API key for authentication                  |
 | `E2B_DOMAIN`  | E2B API domain (default: `your.domain.com`) |
+
+## Traffic JWT Refresh
+
+Sandboxes created with metadata `security.agents.kruise.io/enable-jwt-auth=true` are protected by a short-lived
+**Traffic JWT**. The SDK attaches and refreshes it automatically on every data-plane request (Commands / Filesystem /
+CodeInterpreter) — no caller code change is required:
+
+```java
+NewSandbox body = new NewSandbox()
+    .templateID("code-interpreter")
+    .putMetadataItem("security.agents.kruise.io/enable-jwt-auth", "true");
+Sandbox sandbox = api.create(body);
+sandbox.commands.run("echo hi");                 // carries + refreshes the token automatically
+
+String token = sandbox.getTrafficAccessToken();  // cached token ("" when not JWT-protected)
+token = sandbox.refreshTrafficAccessToken();     // force a refresh
+```
+
+Non-JWT sandboxes and `debug` mode keep the legacy behavior (no `e2b-traffic-access-token` header, no refresh). See
+the [full docs](src/main/java/io/openkruise/agents/client/e2b/README.md#8-traffic-jwt-refresh) and
+[`SandboxTrafficJwtExample`](src/main/java/io/openkruise/agents/client/examples/SandboxTrafficJwtExample.java) for the
+mechanism, refresh-URL routing, rollout, and an end-to-end gateway demo.

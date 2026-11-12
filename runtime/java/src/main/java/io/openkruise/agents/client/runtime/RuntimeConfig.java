@@ -41,6 +41,7 @@ public class RuntimeConfig {
     private final int sandboxPort;
     private final int codeInterpreterPort;
     private final OkHttpClient httpClient;
+    private final TrafficTokenProvider trafficTokenProvider;
 
     protected RuntimeConfig(Builder builder) {
         this.domain = builder.domain;
@@ -55,6 +56,7 @@ public class RuntimeConfig {
         this.sandboxPort = builder.sandboxPort;
         this.codeInterpreterPort = builder.codeInterpreterPort;
         this.httpClient = builder.httpClient;
+        this.trafficTokenProvider = builder.trafficTokenProvider;
     }
 
     /**
@@ -155,13 +157,22 @@ public class RuntimeConfig {
                 }
                 if (sharedHttpClient == null) {
                     if (httpClient != null) {
-                        sharedHttpClient = httpClient;
+                        if (trafficTokenProvider != null) {
+                            sharedHttpClient = httpClient.newBuilder()
+                                .addInterceptor(new TrafficTokenInterceptor(trafficTokenProvider))
+                                .build();
+                        } else {
+                            sharedHttpClient = httpClient;
+                        }
                     } else {
-                        sharedHttpClient = new OkHttpClient.Builder()
+                        OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder()
                             .connectTimeout(requestTimeoutMs, TimeUnit.MILLISECONDS)
                             .readTimeout(requestTimeoutMs, TimeUnit.MILLISECONDS)
-                            .writeTimeout(requestTimeoutMs, TimeUnit.MILLISECONDS)
-                            .build();
+                            .writeTimeout(requestTimeoutMs, TimeUnit.MILLISECONDS);
+                        if (trafficTokenProvider != null) {
+                            clientBuilder.addInterceptor(new TrafficTokenInterceptor(trafficTokenProvider));
+                        }
+                        sharedHttpClient = clientBuilder.build();
                     }
                 }
             }
@@ -181,15 +192,21 @@ public class RuntimeConfig {
                 }
                 if (sharedStreamingClient == null) {
                     if (httpClient != null) {
-                        sharedStreamingClient = httpClient.newBuilder()
-                            .readTimeout(0, TimeUnit.MILLISECONDS)
-                            .build();
+                        OkHttpClient.Builder clientBuilder = httpClient.newBuilder()
+                            .readTimeout(0, TimeUnit.MILLISECONDS);
+                        if (trafficTokenProvider != null) {
+                            clientBuilder.addInterceptor(new TrafficTokenInterceptor(trafficTokenProvider));
+                        }
+                        sharedStreamingClient = clientBuilder.build();
                     } else {
-                        sharedStreamingClient = new OkHttpClient.Builder()
+                        OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder()
                             .connectTimeout(requestTimeoutMs, TimeUnit.MILLISECONDS)
                             .readTimeout(0, TimeUnit.MILLISECONDS)
-                            .writeTimeout(requestTimeoutMs, TimeUnit.MILLISECONDS)
-                            .build();
+                            .writeTimeout(requestTimeoutMs, TimeUnit.MILLISECONDS);
+                        if (trafficTokenProvider != null) {
+                            clientBuilder.addInterceptor(new TrafficTokenInterceptor(trafficTokenProvider));
+                        }
+                        sharedStreamingClient = clientBuilder.build();
                     }
                 }
             }
@@ -334,6 +351,16 @@ public class RuntimeConfig {
     }
 
     /**
+     * Returns the traffic token provider installed for data-plane requests, or
+     * {@code null} when the sandbox is not JWT-protected. When non-null, the
+     * shared OkHttp clients carry a {@link TrafficTokenInterceptor} that
+     * attaches the {@code e2b-traffic-access-token} header to every request.
+     */
+    public TrafficTokenProvider getTrafficTokenProvider() {
+        return trafficTokenProvider;
+    }
+
+    /**
      * Builder pattern, extensible by subclasses.
      */
     public static class Builder {
@@ -349,6 +376,7 @@ public class RuntimeConfig {
         protected int sandboxPort = DEFAULT_RUNTIME_PORT;
         protected int codeInterpreterPort = DEFAULT_CODE_INTERPRETER_PORT;
         protected OkHttpClient httpClient;
+        protected TrafficTokenProvider trafficTokenProvider;
 
         public Builder() {}
 
@@ -430,6 +458,18 @@ public class RuntimeConfig {
          */
         public Builder httpClient(OkHttpClient httpClient) {
             this.httpClient = httpClient;
+            return this;
+        }
+
+        /**
+         * Sets the provider supplying the sandbox traffic access token for
+         * data-plane requests. When non-null, the shared OkHttp clients install
+         * a {@link TrafficTokenInterceptor} that attaches the
+         * {@code e2b-traffic-access-token} header before each request. Leaving
+         * it null preserves the legacy behavior (no traffic token header).
+         */
+        public Builder trafficTokenProvider(TrafficTokenProvider trafficTokenProvider) {
+            this.trafficTokenProvider = trafficTokenProvider;
             return this;
         }
 
